@@ -5,3 +5,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Training checkpoints. The demo is reproduced by train_ai.py; the
+# root best_model.pt state dict was not produced by any current script.
+*.pt
+models/

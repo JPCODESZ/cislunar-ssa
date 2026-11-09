@@ -26,59 +26,40 @@ Sources for the constants and the halo literature are listed in [`docs/reference
 
 ## AI tracking
 
-Tracking is next-state regression on synthetic CR3BP trajectories. Each example is a window of 6-vectors `[x, y, z, vx, vy, vz]`; the label is the state one step ahead. Two entry points share that idea and write different checkpoints. No training log or error table is stored in the repository, so this README does not quote an accuracy number.
+`train_ai.py` is the training path. `train_ai_full.py` calls the same function. Both write `models/cislunar_lstm.pt`, which stores the weights together with the architecture, the z-score normalizer, and the data settings. `eval_ai.py` loads that file, rebuilds the holdout from the saved seed, and writes `models/evaluation_results.npz`. `viz_ai.py` draws that archive. Checkpoints are gitignored (`*.pt` and `models/`); reproduce them by running the scripts.
 
-`src/ai/__init__.py` imports `src/ai/lstm_trainer.py`. That module, as committed, has a pasted shell fragment inside `TrajectoryDataset.__init__` (around line 49), which is a syntax error. Importing the `ai` package therefore fails, and `train_ai.py`, `train_ai_full.py`, and `eval_ai.py` do not run until that fragment is removed. The same file repeats a complete copy of the module after the paste.
+The network is a unidirectional LSTM (input 6, hidden 64, 2 layers, dropout 0.1) followed by a linear map 64 → 32, ReLU, dropout, and a linear map 32 → 6. It is trained with MSE and Adam (`1e-3`) to map 12 consecutive states to the next state. The demo settings in `train_ai.py` are a CPU run of about ten seconds:
 
-### `train_ai.py`
+- seed 42
+- 36 arcs, t ∈ [0, 3], 48 samples (Δt = 3/47 ≈ 0.06383)
+- initial position uniform on x ∈ [0.50, 1.25], y ∈ [−0.45, 0.45], z ∈ [−0.08, 0.08], velocity normal with standard deviations (0.03, 0.06, 0.02)
+- arcs split by trajectory into train / validation / test (about 70% / 15% / 15%). The normalizer is fit on training states only
+- up to 40 epochs, patience 8; the saved weights are the best validation epoch
 
-Short pipeline on top of `src/ai/lstm_trainer.py`.
+On this run every arc integrated (26 train, 5 validation, 5 test, 936 training windows). Training stopped after 39 epochs. Best validation MSE on the normalized 6-vector was 0.221812. The model has 53,990 parameters.
 
-1. Integrate 1000 random cislunar initial conditions to non-dimensional time 10 (200 samples each). Failed integrations are dropped.
-2. Cut sliding windows of length 25. The target is the next state.
-3. Fit a per-component z-score normalizer and save it to `models/normalizer.npz`.
-4. Take a contiguous 70% / 15% / 15% split (the sequences are not shuffled).
-5. Train `CislunarLSTM`: unidirectional LSTM, input 6, hidden 128, 2 layers, dropout 0.2, then a linear layer 128 → 64, ReLU, dropout, and a linear layer 64 → 6. Loss is MSE, optimizer is Adam at `1e-3` with `ReduceLROnPlateau`, up to 30 epochs and patience 10.
-6. Write the best weights as a raw `state_dict` to `models/best_model.pt`, and a small hyperparameter checkpoint to `models/cislunar_lstm_final.pt`.
-7. Roll one random test window forward 100 steps and print the RMS of the position components after undoing the normalization.
+`src/ai/trajectory_predictor.py` (`SimpleLSTMPredictor`, used by `test_ai_tracking.py`) is still a placeholder: `predict` integrates the last state with the CR3BP propagator for 0.1 time units. The package also contains an unused GRU, a physics-informed LSTM, and a second trainer from an earlier draft. They are not the path `eval_ai.py` loads.
 
-### `train_ai_full.py`
+## Results
 
-Wider data pipeline. It uses `ai.data_generator`, `ai.lstm_predictor.CislunarLSTM`, `ai.trainer.TrajectoryTrainer`, and `ai.evaluator.TrajectoryEvaluator`.
+Truth is the CR3BP propagator. The baseline is constant velocity in the rotating frame: from the last state in the window, step `x ← x + v Δt` and hold velocity fixed. The LSTM sees the full window of 12 states; the baseline sees only the last one. A propagator compared with itself has zero error, so it is the reference rather than a second forecaster.
 
-1. Integrate 1000 trajectories on t ∈ [0, 8] (150 samples), drawn from `cislunar`, `near_earth`, `near_moon`, `l1_halo`, and `l2_halo`, with Gaussian state noise of standard deviation `5e-5` and seed 42.
-2. Windows of length 25, prediction horizon 1, stride 2.
-3. Z-score the states and save `mean` / `std` to `models/normalization_params.json`.
-4. Shuffle into 70% / 15% / 15% with seed 42. Batch size 128.
-5. Train a second `CislunarLSTM`: input 6, hidden 128, 3 layers, dropout 0.15, unidirectional. The head is linear 128 → 256, ReLU, dropout, linear 256 → 128, ReLU, dropout, linear 128 → 6. Optimizer is AdamW (`1e-3`, weight decay `1e-5`) with gradient clipping. `physics_weight` is 0, so the physics residual is off. Up to 50 epochs, patience 12.
-6. Save the best epoch to `models/best_lstm.pt` (weights, optimizer, train loss, validation loss) and the loss history to `models/training_history.json`.
-7. Score the test set one step ahead. The printed metrics are overall RMSE, MAE, position RMSE, velocity RMSE, and per-axis RMSE, all in **normalized** units.
+Position RMSE in normalized units is `sqrt(mean((z_true − z_pred)^2))` on x, y, and z after the training z-score. Training standard deviations of position were about 0.641, 0.409, and 0.034, so a physical error in z is weighted more heavily than the same error in x. The table pools every test window (180 one-step windows; five rollouts of 20 steps).
 
-The same package also defines a GRU with the same head shape, and a `PhysicsInformedLSTM` whose forward pass returns a next state plus an acceleration that can be penalized against the CR3BP acceleration. `train_ai_full.py` does not instantiate either of those. `TrajectoryEvaluator.evaluate_long_horizon` can roll a trajectory out and report position RMSE, endpoint drift, and Jacobi mismatch at horizons 10, 50, 100, and 200; the training script calls only the one-step evaluation.
+| | LSTM | Constant velocity |
+| --- | ---: | ---: |
+| One-step position RMSE, normalized | 0.252557 | 0.003666 |
+| 20-step rollout position RMSE, normalized | 0.527801 | 0.376073 |
+| One-step position RMSE, non-dimensional | 0.104522 | 0.001233 |
+| 20-step rollout position RMSE, non-dimensional | 0.226529 | 0.151090 |
 
-`src/ai/trajectory_predictor.py` (`SimpleLSTMPredictor`, used by `test_ai_tracking.py`) is a placeholder. Its `predict` method integrates the last state with the CR3BP propagator for 0.1 time units. It does not train the networks above.
+The LSTM does not beat constant velocity. Over one sample the velocity already carries almost all of the position change (the baseline's one-step error is about 0.001 Earth–Moon distances), and this network's one-step error is about 0.10. On the 20-step rollout the baseline is still lower in both normalized and non-dimensional units.
 
-### `eval_ai.py`
+The figure is the first held-out arc, not the pooled score. On that single arc the non-dimensional position RMSE is 0.121 for the LSTM and 0.241 for constant velocity, so the drawn arc is kinder to the network than the five-arc mean. The title states the pooled normalized rollout error.
 
-Loads `models/cislunar_lstm_final.pt` and `models/normalizer.npz` from the short pipeline, rebuilds that 2-layer network, and compares it with physics on one arc. The initial condition is L1 shifted by +0.01 in x, with vy = 0.1. The truth is `propagate` from t = 0 to 8 (800 samples). The network is seeded with the first `seq_length` states of that arc, then rolled forward by feeding each prediction back into the window. It prints the RMS position error in non-dimensional units, labels the run against fixed cutoffs (below 0.1, below 0.5, or above that), and writes `models/evaluation_results.npz` with the two trajectories, the time grid, and that RMS. Those files are not in the repository.
+![Held-out arc: CR3BP propagator, LSTM rollout, and constant velocity](docs/ai_vs_physics.png)
 
-### `viz_ai.py`
-
-Reads `models/evaluation_results.npz` and draws the physics arc against the AI rollout: rotating-frame x–y, x–z, position error versus time, and the x and y velocity components, plus a 3D overlay with Earth and the Moon. Intended outputs are `docs/ai_vs_physics.png` and `docs/ai_vs_physics_3d.png`. The x–z panel calls `set_zlabel` on a 2D Matplotlib axes, so the script raises before it writes either figure. Neither image is checked in.
-
-### `best_model.pt`
-
-The file at the repository root is a PyTorch zip archive (serialization version 3) holding a raw `state_dict`, with no epoch, optimizer, or loss stored beside the tensors. The keys are a unidirectional 3-layer LSTM and a two-layer head:
-
-| Tensor | Shape |
-| --- | --- |
-| `lstm.weight_ih_l0` | (1024, 6) |
-| `lstm.weight_hh_l{0,1,2}`, `lstm.weight_ih_l{1,2}` | (1024, 256) |
-| `lstm.bias_*_l{0,1,2}` | (1024,) |
-| `fc.0.weight` / `fc.0.bias` | (64, 256) / (64,) |
-| `fc.3.weight` / `fc.3.bias` | (6, 64) / (6,) |
-
-That is input size 6, hidden size 256, three layers, then a linear map 256 → 64 and a linear map 64 → 6. `fc.1` and `fc.2` are present and hold no parameters. The parameter count is 1,339,846. `train_ai.py` is written to save a 2-layer, hidden-128 network under `models/best_model.pt`. `train_ai_full.py` is written to save a 3-layer, hidden-128 network with a 128 → 256 → 128 → 6 head under `models/best_lstm.pt`. The root file is a different network from either of those, and `eval_ai.py` loads the hyperparameter dict in `models/cislunar_lstm_final.pt`.
+A 3D view of the same arc is `docs/ai_vs_physics_3d.png`.
 
 ## Install
 
@@ -110,7 +91,7 @@ print(sol.success, sol.y[:3, -1])
 print(jacobi_integral(state0), jacobi_integral(sol.y[:, -1]))
 ```
 
-These demos import `physics`, `viz`, `debris`, or `orbits` and do not load the `ai` package:
+From the repository root:
 
 ```bash
 python test_basic.py           # Lagrange points, a short arc, Jacobi check, rotating-frame figure
@@ -118,25 +99,22 @@ python test_validation.py      # mass ratio, NASA/JPL Lagrange points, Jacobi ch
 python test_3d.py              # Plotly Earth–Moon view and debris cloud
 python test_3d_research.py     # same views, with the Lagrange-point check printed
 python test_professional.py    # dark-theme 3D figure and orbital-regime comparison
-```
+python test_advanced.py        # animation, placeholder predictor, halo single-shooter
+python test_ai_tracking.py     # placeholder predictor and a Plotly comparison
 
-`test_advanced.py` and `test_ai_tracking.py` import the `ai` package, so they hit the same syntax error as the trainers. After that import is fixed, the tracking scripts are:
-
-```bash
-python train_ai.py            # writes models/best_model.pt and models/cislunar_lstm_final.pt
-python train_ai_full.py       # writes models/best_lstm.pt
-python eval_ai.py             # needs models/cislunar_lstm_final.pt and models/normalizer.npz
-python viz_ai.py              # needs models/evaluation_results.npz
+python train_ai.py             # writes models/cislunar_lstm.pt
+python train_ai_full.py        # same trainer as train_ai.py
+python eval_ai.py              # scores that checkpoint, writes models/evaluation_results.npz
+python viz_ai.py               # writes docs/ai_vs_physics.png and docs/ai_vs_physics_3d.png
 ```
 
 ## Project structure
 
 ```
-├── train_ai.py              # 2-layer LSTM training entry point
-├── train_ai_full.py         # 3-layer LSTM training entry point
-├── eval_ai.py               # autoregressive comparison against propagate
-├── viz_ai.py                # physics-vs-AI figures from an eval archive
-├── best_model.pt            # 3-layer, hidden-256 state dict (see above)
+├── train_ai.py              # supported LSTM trainer (CPU demo settings)
+├── train_ai_full.py         # calls train_ai.main
+├── eval_ai.py               # holdout score vs constant velocity
+├── viz_ai.py                # propagator / LSTM / constant-velocity figures
 ├── test_*.py                # propagator, validation, halo, and visualization demos
 ├── requirements.txt
 ├── src/
@@ -144,22 +122,21 @@ python viz_ai.py              # needs models/evaluation_results.npz
 │   ├── orbits/              # halo initial guess and single-shooter
 │   ├── perturbations/       # solar gravity and radiation pressure
 │   ├── debris/              # synthetic catalog and conjunction screen
-│   ├── ai/                  # datasets, LSTM/GRU, trainer, evaluator, inference
+│   ├── ai/                  # LSTM trainer plus earlier unused model drafts
 │   └── viz/                 # rotating-frame, Plotly 3D, animation
-├── docs/                    # HTML views, references, trajectory figure
+├── docs/                    # HTML views, references, trajectory and tracking figures
 ├── data/
 │   ├── nasa_ephemerides/    # placeholder
 │   └── synthetic_debris/    # placeholder
 └── tests/                   # package marker only; demos live at the repo root
 ```
 
+`models/` and `*.pt` are gitignored. A previous `best_model.pt` at the repository root was a 3-layer, hidden-256 state dict that no script wrote or loaded; it has been removed.
+
 ## Next steps
 
-- Remove the pasted shell text in `src/ai/lstm_trainer.py` so the `ai` package imports, then rerun training from a fixed seed.
-- Keep one checkpoint layout. The root `best_model.pt` is a hidden-256, 3-layer network; the two training scripts save hidden-128 networks to `models/` and do not load this file.
-- Record the metrics the evaluators already compute (one-step RMSE in normalized units, multi-step position RMS, Jacobi drift) from a completed run. Nothing in the tree is that run.
-- Fix the x–z panel in `viz_ai.py` (`set_ylabel`, or a 3D axes) so the comparison figures can be written.
+- Teach the next-state model the velocity carry (for example by predicting the increment `x_{k+1} - x_k`) so a short rollout can beat constant velocity. The demo above does not.
 - Add the solar-gravity and radiation-pressure accelerations inside the propagator, with a switch to turn them off.
 - Fill `data/nasa_ephemerides/` and check halo families from the single-shooter against published NRHO and Gateway orbits.
 - Implement the LEO and GEO branches of the debris catalog. `generate_debris_catalog` currently raises `NotImplementedError` for those regions.
-- Replace `SimpleLSTMPredictor` with the trained network so `test_ai_tracking.py` is a real rollout.
+- Replace `SimpleLSTMPredictor` with the trained network so `test_ai_tracking.py` rolls out `models/cislunar_lstm.pt`.
