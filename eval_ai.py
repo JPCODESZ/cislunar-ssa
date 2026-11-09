@@ -1,96 +1,126 @@
 #!/usr/bin/env python
-"""Evaluate trained AI model and create visualizations."""
+"""Score the trained LSTM against a constant-velocity baseline.
+
+Truth is the CR3BP propagator on held-out arcs from the same seed as
+training. The checkpoint ``models/cislunar_lstm.pt`` stores the
+architecture, the normalizer, and the data settings used to rebuild
+that holdout.
+
+Position RMSE in normalized units is
+
+    sqrt(mean((z_true - z_pred)^2))
+
+on the three position components after the training z-score. The
+constant-velocity baseline steps ``x <- x + v dt`` and leaves velocity
+unchanged. It uses only the last state of the window; the LSTM uses
+the whole window.
+"""
 
 import sys
+
 import numpy as np
-import torch
 
-sys.path.insert(0, 'src')
+sys.path.insert(0, "src")
 
-from ai.lstm_trainer import CislunarLSTM, StateNormalizer
-from physics.cr3bp import propagate
-from physics.lagrange import compute_lagrange_points
-
-print("=" * 60)
-print("CISLUNAR SSA - AI EVALUATION & INFERENCE")
-print("=" * 60)
-
-# Load model
-print("\n[1] Loading model...")
-checkpoint = torch.load('models/cislunar_lstm_final.pt', map_location='cpu')
-model = CislunarLSTM(
-    input_size=6,
-    hidden_size=checkpoint['hidden_size'],
-    num_layers=checkpoint['num_layers'],
-    dropout=checkpoint['dropout']
+from ai.lstm_trainer import (
+    CHECKPOINT_PATH,
+    EVAL_RESULTS_PATH,
+    load_checkpoint,
+    plot_bundle,
+    prepare_datasets,
+    score_against_baseline,
 )
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
 
-# Load normalizer
-normalizer = StateNormalizer()
-normalizer.load('models/normalizer.npz')
 
-seq_length = checkpoint['seq_length']
-print(f"  Sequence length: {seq_length}")
+def _line(label, lstm_value, cv_value):
+    winner = "LSTM" if lstm_value < cv_value else "constant velocity"
+    print(f"  {label}")
+    print(f"    LSTM:              {lstm_value:.6f}")
+    print(f"    constant velocity: {cv_value:.6f}")
+    print(f"    lower error:       {winner}")
 
-# Test 1: Compare AI vs Physics propagation
-print("\n[2] AI vs Physics Comparison...")
 
-# Start near L1
-L = compute_lagrange_points()
-state0 = [L['L1'][0] + 0.01, 0.0, 0.0, 0.0, 0.1, 0.0]
+def main():
+    print("=" * 60)
+    print("CISLUNAR SSA - AI EVALUATION")
+    print("=" * 60)
 
-# True physics propagation
-t_eval = np.linspace(0, 8, 800)
-true_sol = propagate(state0, (0, 8), t_eval)
+    print("\n[1] Loading", CHECKPOINT_PATH)
+    model, normalizer, checkpoint = load_checkpoint(CHECKPOINT_PATH)
+    print(f"  hidden={checkpoint['hidden_size']} layers={checkpoint['num_layers']} "
+          f"seq_length={checkpoint['seq_length']} epochs_ran={checkpoint['epochs_ran']}")
+    print(f"  best val MSE: {checkpoint['best_val_loss']:.6f}")
 
-# AI prediction
-print("  Running AI prediction...")
-ai_states = [state0]
+    print("\n[2] Rebuilding the holdout from the checkpoint seed...")
+    data = prepare_datasets(
+        n_samples=checkpoint["n_samples"],
+        t_max=checkpoint["t_max"],
+        n_points=checkpoint["n_points"],
+        seq_length=checkpoint["seq_length"],
+        seed=checkpoint["seed"],
+        val_ratio=checkpoint["val_ratio"],
+        test_ratio=checkpoint["test_ratio"],
+        position_low=checkpoint["position_low"],
+        position_high=checkpoint["position_high"],
+        velocity_scale=checkpoint["velocity_scale"],
+    )
+    if not np.allclose(data["normalizer"].mean, normalizer.mean, rtol=1e-5, atol=1e-6):
+        raise RuntimeError("Rebuilt training mean does not match the checkpoint normalizer.")
+    if not np.allclose(data["normalizer"].std, normalizer.std, rtol=1e-5, atol=1e-6):
+        raise RuntimeError("Rebuilt training std does not match the checkpoint normalizer.")
 
-# Build initial sequence using physics
-init_seq = []
-for i in range(seq_length):
-    t = i * (8 / 800)
-    sol = propagate(state0, (0, t), [t])
-    if sol.success:
-        init_seq.append(sol.y[:, -1])
-    else:
-        init_seq.append(state0)
+    print("\n[3] Scoring...")
+    metrics = score_against_baseline(
+        model,
+        normalizer,
+        data["test_trajs"],
+        seq_length=checkpoint["seq_length"],
+        dt=data["dt"],
+        rollout_steps=checkpoint["rollout_steps"],
+    )
+    print(f"  Test arcs: {metrics['n_test_trajectories']}")
+    print(f"  One-step windows: {metrics['n_onestep']}")
+    print(f"  Rollout length: {metrics['rollout_steps']} steps "
+          f"(dt = {data['dt']:.6f})")
+    print("\n  Normalized position RMSE")
+    _line("one-step (teacher forced)",
+          metrics["lstm_onestep_pos_rmse_norm"],
+          metrics["cv_onestep_pos_rmse_norm"])
+    _line(f"{metrics['rollout_steps']}-step autoregressive rollout",
+          metrics["lstm_rollout_pos_rmse_norm"],
+          metrics["cv_rollout_pos_rmse_norm"])
+    print("\n  Non-dimensional position RMSE (Earth-Moon distance = 1)")
+    _line("one-step (teacher forced)",
+          metrics["lstm_onestep_pos_rmse_nondim"],
+          metrics["cv_onestep_pos_rmse_nondim"])
+    _line(f"{metrics['rollout_steps']}-step autoregressive rollout",
+          metrics["lstm_rollout_pos_rmse_nondim"],
+          metrics["cv_rollout_pos_rmse_nondim"])
 
-# Normalize and predict
-current_seq = normalizer.transform(np.array(init_seq))
+    beats = metrics["lstm_rollout_pos_rmse_norm"] < metrics["cv_rollout_pos_rmse_norm"]
+    print("\n  LSTM rollout beats constant velocity "
+          f"(normalized): {'yes' if beats else 'no'}")
 
-with torch.no_grad():
-    for i in range(len(t_eval) - seq_length):
-        inp = torch.FloatTensor(current_seq).unsqueeze(0)
-        pred_norm = model(inp).numpy()[0]
-        pred = normalizer.inverse_transform(pred_norm)
-        ai_states.append(pred)
-        
-        # Roll sequence
-        current_seq = np.roll(current_seq, -1, axis=0)
-        current_seq[-1] = pred_norm
+    time, true_traj, lstm_traj, cv_traj = plot_bundle(
+        model,
+        normalizer,
+        data["test_trajs"][0],
+        seq_length=checkpoint["seq_length"],
+        dt=data["dt"],
+        rollout_steps=checkpoint["rollout_steps"],
+    )
+    np.savez(
+        EVAL_RESULTS_PATH,
+        true_trajectory=true_traj,
+        ai_trajectory=lstm_traj,
+        cv_trajectory=cv_traj,
+        time=time,
+        rms_error=metrics["lstm_rollout_pos_rmse_norm"],
+        **metrics,
+    )
+    print(f"\n  Wrote {EVAL_RESULTS_PATH}")
+    print("=" * 60)
 
-ai_states = np.array(ai_states)
 
-# Compute error
-min_len = min(len(true_sol.y[0]), len(ai_states))
-error = np.sqrt(np.mean((true_sol.y[:3, :min_len].T - ai_states[:min_len, :3])**2))
-print(f"  RMS position error: {error:.4f}")
-
-# Save results
-print("\n[3] Saving results...")
-np.savez('models/evaluation_results.npz',
-         true_trajectory=true_sol.y.T,
-         ai_trajectory=ai_states,
-         time=true_sol.t,
-         rms_error=error)
-
-print("\n" + "=" * 60)
-print("EVALUATION COMPLETE")
-print("=" * 60)
-print(f"  Results saved: models/evaluation_results.npz")
-print(f"  RMS Error: {error:.4f}")
-print(f"  {'EXCELLENT' if error < 0.1 else 'GOOD' if error < 0.5 else 'NEEDS IMPROVEMENT'}")
+if __name__ == "__main__":
+    main()
