@@ -1,105 +1,117 @@
 #!/usr/bin/env python
-"""Train AI model on CR3BP trajectories."""
+"""Train the CR3BP next-state LSTM and save models/cislunar_lstm.pt.
+
+Settings below are the short CPU demo: a few dozen arcs and about ten
+epochs. Run from the repository root. ``train_ai_full.py`` calls this
+same function. ``eval_ai.py`` loads the checkpoint written here.
+"""
 
 import sys
-import os
-import numpy as np
+
 import torch
-
-sys.path.insert(0, 'src')
-
-from ai.lstm_trainer import (
-    CislunarLSTM, TrajectoryDataset, TrajectoryTrainer,
-    generate_cr3bp_trajectories, create_sequences, StateNormalizer,
-    evaluate_model
-)
 from torch.utils.data import DataLoader
 
-print("=" * 60)
-print("CISLUNAR SSA - AI TRAINING PIPELINE")
-print("=" * 60)
+sys.path.insert(0, "src")
 
-# Create models directory
-os.makedirs('models', exist_ok=True)
+from ai.lstm_trainer import (
+    CHECKPOINT_PATH,
+    CislunarLSTM,
+    TrajectoryDataset,
+    TrajectoryTrainer,
+    prepare_datasets,
+    save_checkpoint,
+)
 
-# 1. Generate data
-print("\n[1] Generating CR3BP trajectory dataset...")
-trajectories = generate_cr3bp_trajectories(n_samples=1000, t_max=10.0, n_points=200)
+# Documented demo settings. Changing these changes the checkpoint that
+# eval_ai.py rebuilds its holdout from.
+CONFIG = {
+    "seed": 42,
+    "n_samples": 36,
+    "t_max": 3.0,
+    "n_points": 48,
+    "seq_length": 12,
+    "hidden_size": 64,
+    "num_layers": 2,
+    "dropout": 0.1,
+    "epochs": 40,
+    "patience": 8,
+    "batch_size": 64,
+    "learning_rate": 1e-3,
+    "val_ratio": 0.15,
+    "test_ratio": 0.15,
+    "rollout_steps": 20,
+    "position_low": (0.50, -0.45, -0.08),
+    "position_high": (1.25, 0.45, 0.08),
+    "velocity_scale": (0.03, 0.06, 0.02),
+}
 
-# 2. Create sequences
-print("\n[2] Creating sequences...")
-seq_length = 25
-X, y = create_sequences(trajectories, seq_length=seq_length)
-print(f"  Total sequences: {len(X)}")
-print(f"  Sequence shape: {X.shape}")
-print(f"  Target shape: {y.shape}")
 
-# 3. Normalize
-print("\n[3] Normalizing data...")
-normalizer = StateNormalizer()
-X_norm = normalizer.fit_transform(X.reshape(-1, 6)).reshape(X.shape)
-y_norm = normalizer.transform(y)
-normalizer.save('models/normalizer.npz')
-print(f"  Mean: {normalizer.mean}")
-print(f"  Std:  {normalizer.std}")
+def main():
+    print("=" * 60)
+    print("CISLUNAR SSA - AI TRAINING")
+    print("=" * 60)
+    print("  Checkpoint:", CHECKPOINT_PATH)
+    for key in ("seed", "n_samples", "t_max", "n_points", "seq_length", "epochs"):
+        print(f"  {key}: {CONFIG[key]}")
 
-# 4. Split data
-print("\n[4] Splitting train/val/test...")
-n_total = len(X_norm)
-n_train = int(0.7 * n_total)
-n_val = int(0.15 * n_total)
+    torch.manual_seed(CONFIG["seed"])
 
-X_train, y_train = X_norm[:n_train], y_norm[:n_train]
-X_val, y_val = X_norm[n_train:n_train+n_val], y_norm[n_train:n_train+n_val]
-X_test, y_test = X_norm[n_train+n_val:], y_norm[n_train+n_val:]
+    print("\n[1] Integrating training arcs...")
+    data = prepare_datasets(
+        n_samples=CONFIG["n_samples"],
+        t_max=CONFIG["t_max"],
+        n_points=CONFIG["n_points"],
+        seq_length=CONFIG["seq_length"],
+        seed=CONFIG["seed"],
+        val_ratio=CONFIG["val_ratio"],
+        test_ratio=CONFIG["test_ratio"],
+        position_low=CONFIG["position_low"],
+        position_high=CONFIG["position_high"],
+        velocity_scale=CONFIG["velocity_scale"],
+    )
+    print(f"  Integrated: {data['n_integrated']}")
+    print(f"  Train arcs: {len(data['train_trajs'])}, "
+          f"val: {len(data['val_trajs'])}, test: {len(data['test_trajs'])}")
+    print(f"  Train windows: {len(data['X_train'])}, val windows: {len(data['X_val'])}")
+    print(f"  State mean: {data['normalizer'].mean}")
+    print(f"  State std:  {data['normalizer'].std}")
 
-print(f"  Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+    train_loader = DataLoader(
+        TrajectoryDataset(data["X_train"], data["y_train"]),
+        batch_size=CONFIG["batch_size"],
+        shuffle=True,
+    )
+    val_loader = DataLoader(
+        TrajectoryDataset(data["X_val"], data["y_val"]),
+        batch_size=CONFIG["batch_size"],
+    )
 
-# 5. Create DataLoaders
-print("\n[5] Creating DataLoaders...")
-batch_size = 64
-train_dataset = TrajectoryDataset(X_train, y_train)
-val_dataset = TrajectoryDataset(X_val, y_val)
-test_dataset = TrajectoryDataset(X_test, y_test)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = CislunarLSTM(
+        input_size=6,
+        hidden_size=CONFIG["hidden_size"],
+        num_layers=CONFIG["num_layers"],
+        dropout=CONFIG["dropout"],
+    )
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\n[2] Training on {device} ({n_params:,} parameters)...")
+    trainer = TrajectoryTrainer(model, device=device, lr=CONFIG["learning_rate"])
+    history = trainer.train(
+        train_loader,
+        val_loader,
+        epochs=CONFIG["epochs"],
+        patience=CONFIG["patience"],
+    )
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=batch_size)
-test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    save_checkpoint(CHECKPOINT_PATH, model, data["normalizer"], CONFIG, history, trainer.best_val_loss)
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
+    print(f"  Best val MSE (normalized states): {trainer.best_val_loss:.6f}")
+    print(f"  Epochs run: {len(history['train_loss'])}")
+    print(f"  Checkpoint: {CHECKPOINT_PATH}")
+    print("  Next: python eval_ai.py && python viz_ai.py")
 
-# 6. Build model
-print("\n[6] Building model...")
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"  Device: {device}")
 
-model = CislunarLSTM(input_size=6, hidden_size=128, num_layers=2, dropout=0.2)
-n_params = sum(p.numel() for p in model.parameters())
-print(f"  Parameters: {n_params:,}")
-
-# 7. Train
-print("\n[7] Training...")
-trainer = TrajectoryTrainer(model, device=device, lr=1e-3)
-history = trainer.train(train_loader, val_loader, epochs=30, patience=10)
-
-# 8. Evaluate
-print("\n[8] Evaluating on test set...")
-model.load_state_dict(torch.load('models/best_model.pt', map_location=device))
-model.to(device)
-
-true_traj, ai_traj, rms_error = evaluate_model(model, normalizer, X_test, y_test, n_steps=100)
-print(f"  RMS position error (100 steps): {rms_error:.4f}")
-
-# 9. Save final model
-torch.save({
-    'model_state_dict': model.state_dict(),
-    'hidden_size': 128,
-    'num_layers': 2,
-    'dropout': 0.2,
-    'seq_length': seq_length
-}, 'models/cislunar_lstm_final.pt')
-
-print("\n" + "=" * 60)
-print("TRAINING COMPLETE")
-print("=" * 60)
-print("  Model saved: models/cislunar_lstm_final.pt")
-print("  Best model:  models/best_model.pt")
-print("  Normalizer:  models/normalizer.npz")
+if __name__ == "__main__":
+    main()
